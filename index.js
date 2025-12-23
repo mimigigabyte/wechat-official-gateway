@@ -4,6 +4,9 @@
 
   const app = express();
 
+  //临时调试
+  app.use((req, _res, next) => { console.log('IN', req.method, req.url); next(); });
+
   // 必须保留 raw body，用于和 Vercel 侧签名一致
   app.use(express.json({
     verify: (req, _res, buf) => {

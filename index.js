@@ -103,5 +103,95 @@
     }
   });
 
+  // ===== JS-SDK 签名：网关接口 =====
+  let jsapiTicketCache = { ticket: '', expiresAt: 0 };
+
+  async function getJsApiTicket() {
+    if (jsapiTicketCache.ticket && Date.now() < jsapiTicketCache.expiresAt) return jsapiTicketCache.ticket;
+
+    const accessToken = await getAccessToken();
+    const url = 'https://api.weixin.qq.com/cgi-bin/ticket/getticket';
+
+    const { data } = await axios.get(url, {
+      params: { access_token: accessToken, type: 'jsapi' }
+    });
+
+    if (!data || data.errcode !== 0 || !data.ticket) {
+      throw new Error(`get jsapi_ticket failed: ${data?.errcode || ''} ${data?.errmsg || ''}`.trim());
+    }
+
+    const expiresIn = typeof data.expires_in === 'number' ? data.expires_in : 7000;
+    jsapiTicketCache = { ticket: data.ticket, expiresAt: Date.now() + (expiresIn - 300) * 1000 };
+    return jsapiTicketCache.ticket;
+  }
+
+  function nonceStr(len = 16) {
+    const chars = 'abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
+    let out = '';
+    for (let i = 0; i < len; i++) out += chars[Math.floor(Math.random() * chars.length)];
+    return out;
+  }
+
+  function sha1(input) {
+    return crypto.createHash('sha1').update(input).digest('hex');
+  }
+
+  app.post('/wechat/js-sdk-config', async (req, res) => {
+    try {
+      // 1) 验签（和 /wechat/subscribe-send 一样）
+      const secret = process.env.WECHAT_GATEWAY_SECRET;
+      if (!secret) return res.status(500).json({ success: false, error: 'WECHAT_GATEWAY_SECRET 未配置' });
+
+      const ts = req.header('x-wechat-gateway-ts');
+      const sig = req.header('x-wechat-gateway-signature');
+      const rawBody = req.rawBody || '';
+
+      if (!ts || !sig) return res.status(401).json({ success: false, error: 'missing signature headers' });
+
+      const now = Math.floor(Date.now() / 1000);
+      const tsNum = Number(ts);
+      if (!Number.isFinite(tsNum) || Math.abs(now - tsNum) > 300) {
+        return res.status(401).json({ success: false, error: 'signature timestamp expired' });
+      }
+
+      const expected = hmacSha256Hex(secret, ts, rawBody);
+      if (!timingSafeEqualHex(expected, sig)) {
+        return res.status(401).json({ success: false, error: 'invalid signature' });
+      }
+
+      // 2) 参数
+      const appId = process.env.WECHAT_APP_ID;
+      if (!appId) return res.status(500).json({ success: false, error: 'WECHAT_APP_ID 未配置' });
+
+      const rawUrl = req.body?.url;
+      if (!rawUrl || typeof rawUrl !== 'string') {
+        return res.status(400).json({ success: false, error: 'missing url' });
+      }
+
+      // 必须去掉 hash
+      const urlToSign = rawUrl.split('#')[0];
+
+      // 3) 生成签名
+      const ticket = await getJsApiTicket();
+      const noncestr = nonceStr();
+      const timestamp = Math.floor(Date.now() / 1000);
+
+      const plain =
+        `jsapi_ticket=${ticket}` +
+        `&noncestr=${noncestr}` +
+        `&timestamp=${timestamp}` +
+        `&url=${urlToSign}`;
+
+      const signature = sha1(plain);
+
+      return res.json({
+        success: true,
+        data: { appId, timestamp, nonceStr: noncestr, signature }
+      });
+    } catch (e) {
+      return res.status(500).json({ success: false, error: e instanceof Error ? e.message : String(e) });
+    }
+  });
+
   const port = Number(process.env.PORT || 80); 
   app.listen(port, '0.0.0.0')

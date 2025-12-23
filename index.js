@@ -1,6 +1,10 @@
   const express = require('express');
   const crypto = require('crypto');
+  const fs = require('fs');
+  const path = require('path');
+  const http = require('http');
   const https = require('https');
+  const tls = require('tls');
   const axios = require('axios');
 
   const app = express();
@@ -26,13 +30,93 @@
     return crypto.timingSafeEqual(aa, bb);
   }
 
+  function getExtraCaCandidates() {
+    const candidates = new Set();
+    const extra = [
+      '/app/cert/ca.pem',
+      '/app/cert/ca.crt',
+      '/app/cert/rootca.pem',
+      '/app/cert/rootca.crt',
+      '/app/cert/cacert.pem',
+      '/app/cert/cacert.crt',
+      '/app/cert/tcloudbase-ca.pem',
+      '/app/cert/tcloudbase-ca.crt',
+    ];
+    for (const p of extra) candidates.add(p);
+
+    try {
+      const dir = '/app/cert';
+      if (fs.existsSync(dir) && fs.statSync(dir).isDirectory()) {
+        for (const f of fs.readdirSync(dir)) {
+          if (!f) continue;
+          const lower = String(f).toLowerCase();
+          if (!lower.endsWith('.pem') && !lower.endsWith('.crt') && !lower.endsWith('.cer')) continue;
+          candidates.add(path.join(dir, f));
+        }
+      }
+    } catch {
+      // ignore
+    }
+    return Array.from(candidates);
+  }
+
+  function loadExtraCas() {
+    const loaded = [];
+    const candidates = getExtraCaCandidates();
+
+    try {
+      const fromEnv = process.env.WECHAT_EXTRA_CA_PEM;
+      if (fromEnv && String(fromEnv).includes('BEGIN CERTIFICATE')) {
+        loaded.push({ path: 'env:WECHAT_EXTRA_CA_PEM', pem: String(fromEnv) });
+      }
+    } catch {
+      // ignore
+    }
+
+    for (const p of candidates) {
+      try {
+        if (!fs.existsSync(p)) continue;
+        const stat = fs.statSync(p);
+        if (!stat.isFile() || stat.size <= 0) continue;
+        const pem = fs.readFileSync(p, 'utf8');
+        if (pem && pem.includes('BEGIN CERTIFICATE')) {
+          loaded.push({ path: p, pem });
+        }
+      } catch {
+        // ignore
+      }
+    }
+    return loaded;
+  }
+
+  const extraCas = loadExtraCas();
+  const wxTrustedCas = tls.rootCertificates.concat(extraCas.map((x) => x.pem));
+  const allowInsecureWechatTls = String(process.env.WECHAT_TLS_INSECURE || '') === '1';
+  const wxHttpsAgent = new https.Agent({
+    keepAlive: true,
+    ca: wxTrustedCas,
+    rejectUnauthorized: !allowInsecureWechatTls,
+  });
+  const wxHttpsAgentInsecure = new https.Agent({
+    keepAlive: true,
+    rejectUnauthorized: false,
+  });
+
+  // 微信云托管「开放接口服务」模式：
+  // - 在云托管控制台开启“开放接口服务”，并在“微信令牌权限配置”里配置接口路径白名单
+  // - 容器内调用形式与官方接口文档一致，但无需携带 access_token / cloudbase_access_token
+  // - 建议默认走 HTTP（避免云托管拦截 HTTPS 产生 self-signed 证书错误）
+  const openApiEnabled = String(process.env.WECHAT_OPENAPI_ENABLED || '') === '1';
+  const openApiProtocol = (process.env.WECHAT_OPENAPI_PROTOCOL || (openApiEnabled ? 'http' : 'https')).toLowerCase();
+  const wechatBaseUrl = `${openApiProtocol === 'http' ? 'http' : 'https'}://api.weixin.qq.com`;
+
   // WeChat OpenAPI requests:
   // - 禁用 env proxy（云环境可能注入 HTTP(S)_PROXY 导致 MITM/self-signed）
-  // - 强制使用 https agent（避免某些环境自动代理/证书链异常）
+  // - 指定 CA（优先加载云托管 /app/cert 下的根证书）
   const wxHttp = axios.create({
     timeout: 10000,
     proxy: false,
-    httpsAgent: new https.Agent({ keepAlive: true }),
+    httpsAgent: wxHttpsAgent,
     headers: { 'User-Agent': 'wechat-official-gateway/1.0' },
   });
 
@@ -103,6 +187,10 @@
   let accessTokenCache = { token: '', expiresAt: 0 };
 
   async function getAccessToken() {
+    if (openApiEnabled) {
+      // 开放接口服务模式不需要 access_token
+      return '';
+    }
     if (accessTokenCache.token && Date.now() < accessTokenCache.expiresAt) return accessTokenCache.token;
 
     const appId = process.env.WECHAT_APP_ID;
@@ -112,12 +200,12 @@
     // 先用 Node fetch（不吃 env proxy），失败再回退 axios（便于对比诊断）
     let data = null;
     try {
-      data = await wxFetchJson('https://api.weixin.qq.com/cgi-bin/token', {
+      data = await wxFetchJson(`${wechatBaseUrl}/cgi-bin/token`, {
         params: { grant_type: 'client_credential', appid: appId, secret },
       });
     } catch (e) {
       try {
-        const out = await wxHttp.get('https://api.weixin.qq.com/cgi-bin/token', {
+        const out = await wxHttp.get(`${wechatBaseUrl}/cgi-bin/token`, {
           params: { grant_type: 'client_credential', appid: appId, secret }
         });
         data = out.data;
@@ -141,6 +229,11 @@
       ok: true,
       node: process.version,
       proxyEnv: getProxyEnvSnapshot(),
+      extraCaFiles: extraCas.map((x) => x.path),
+      wechatTlsInsecure: allowInsecureWechatTls,
+      openApiEnabled,
+      openApiProtocol,
+      wechatBaseUrl,
       now: new Date().toISOString(),
     }),
   );
@@ -157,6 +250,7 @@
             path: '/',
             method: 'GET',
             timeout: 10000,
+            agent: wxHttpsAgent,
           },
           (r) => {
             const socket = r.socket;
@@ -173,6 +267,92 @@
                     valid_to: cert.valid_to,
                     fingerprint256: cert.fingerprint256,
                     serialNumber: cert.serialNumber,
+                  }
+                : null,
+            });
+          },
+        );
+        req.on('error', reject);
+        req.on('timeout', () => req.destroy(new Error('timeout')));
+        req.end();
+      });
+
+      return res.json({ ok: true, proxyEnv, ...result });
+    } catch (e) {
+      return res.json({
+        ok: false,
+        proxyEnv,
+        extraCaFiles: extraCas.map((x) => x.path),
+        error: e instanceof Error ? e.message : String(e),
+        code: e && e.code ? String(e.code) : '',
+      });
+    }
+  });
+
+  // 诊断：测试 HTTP 直连（开放接口服务推荐默认用 HTTP，避免证书问题）
+  app.get('/debug/wechat-http', async (_req, res) => {
+    try {
+      const result = await new Promise((resolve, reject) => {
+        const req = http.request(
+          {
+            hostname: 'api.weixin.qq.com',
+            port: 80,
+            path: '/',
+            method: 'GET',
+            timeout: 10000,
+          },
+          (r) => {
+            r.resume();
+            resolve({ statusCode: r.statusCode || 0, headers: r.headers || {} });
+          },
+        );
+        req.on('error', reject);
+        req.on('timeout', () => req.destroy(new Error('timeout')));
+        req.end();
+      });
+      return res.json({ ok: true, ...result });
+    } catch (e) {
+      return res.json({ ok: false, error: e instanceof Error ? e.message : String(e) });
+    }
+  });
+
+  function certToPem(cert) {
+    if (!cert || !cert.raw) return '';
+    const b64 = Buffer.from(cert.raw).toString('base64');
+    const lines = b64.match(/.{1,64}/g) || [];
+    return `-----BEGIN CERTIFICATE-----\n${lines.join('\n')}\n-----END CERTIFICATE-----\n`;
+  }
+
+  // 诊断（不校验证书）：用于导出云环境返回的证书链，便于定位是谁在 MITM
+  app.get('/debug/wechat-tls-insecure', async (_req, res) => {
+    const proxyEnv = getProxyEnvSnapshot();
+    try {
+      const result = await new Promise((resolve, reject) => {
+        const req = https.request(
+          {
+            hostname: 'api.weixin.qq.com',
+            port: 443,
+            path: '/',
+            method: 'GET',
+            timeout: 10000,
+            agent: wxHttpsAgentInsecure,
+          },
+          (r) => {
+            const socket = r.socket;
+            const cert = socket && socket.getPeerCertificate ? socket.getPeerCertificate(true) : null;
+            r.resume();
+            resolve({
+              statusCode: r.statusCode || 0,
+              cert: cert
+                ? {
+                    subject: cert.subject,
+                    issuer: cert.issuer,
+                    subjectaltname: cert.subjectaltname,
+                    valid_from: cert.valid_from,
+                    valid_to: cert.valid_to,
+                    fingerprint256: cert.fingerprint256,
+                    serialNumber: cert.serialNumber,
+                    pem: certToPem(cert),
                   }
                 : null,
             });
@@ -223,8 +403,9 @@
         return res.status(400).json({ success: false, error: 'missing openId/templateId/data' });
       }
 
-      const accessToken = await getAccessToken();
-      const wxUrl = `https://api.weixin.qq.com/cgi-bin/message/subscribe/bizsend?access_token=${encodeURIComponent(accessToken)}`;
+      const wxUrl = openApiEnabled
+        ? `${wechatBaseUrl}/cgi-bin/message/subscribe/bizsend`
+        : `${wechatBaseUrl}/cgi-bin/message/subscribe/bizsend?access_token=${encodeURIComponent(await getAccessToken())}`;
 
       const body = {
         touser: openId,
@@ -238,7 +419,11 @@
       try {
         wxOut = await wxFetchJson(wxUrl, { method: 'POST', body });
       } catch (e) {
-        return res.status(502).json({ success: false, error: `wechat bizsend http failed: ${e instanceof Error ? e.message : String(e)}` });
+        return res.status(502).json({
+          success: false,
+          error: `wechat bizsend http failed: ${e instanceof Error ? e.message : String(e)}`,
+          hint: openApiEnabled ? '若提示 api unauthorized，请在云托管控制台-云调用-微信令牌权限配置中添加 /cgi-bin/message/subscribe/bizsend' : undefined,
+        });
       }
 
       if (wxOut?.errcode && wxOut.errcode !== 0) {
@@ -259,11 +444,11 @@
     if (jsapiTicketCache.ticket && Date.now() < jsapiTicketCache.expiresAt) return jsapiTicketCache.ticket;
 
     const accessToken = await getAccessToken();
-    const url = 'https://api.weixin.qq.com/cgi-bin/ticket/getticket';
+    const url = `${wechatBaseUrl}/cgi-bin/ticket/getticket`;
 
     try {
       const data = await wxFetchJson(url, {
-        params: { access_token: accessToken, type: 'jsapi' },
+        params: openApiEnabled ? { type: 'jsapi' } : { access_token: accessToken, type: 'jsapi' },
       });
 
       if (!data || data.errcode !== 0 || !data.ticket) {

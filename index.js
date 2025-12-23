@@ -316,6 +316,28 @@
     }
   });
 
+  // 诊断：开放接口服务是否真正生效（无需签名；用于检查“开关/权限配置/资源复用”）
+  // 预期：
+  // - 若“开放接口服务”未开启：通常返回 access_token missing（如 41001）
+  // - 若已开启但“微信令牌权限配置”没加：通常返回 api unauthorized
+  // - 若已开启且配置正确：返回 { errcode:0, ticket:..., expires_in:... }
+  app.get('/debug/openapi-ticket', async (_req, res) => {
+    try {
+      const data = await wxFetchJson(`${wechatBaseUrl}/cgi-bin/ticket/getticket`, {
+        params: openApiEnabled ? { type: 'jsapi' } : { type: 'jsapi' },
+      });
+      return res.json({ ok: true, openApiEnabled, openApiProtocol, wechatBaseUrl, data });
+    } catch (e) {
+      return res.json({
+        ok: false,
+        openApiEnabled,
+        openApiProtocol,
+        wechatBaseUrl,
+        error: e instanceof Error ? e.message : String(e),
+      });
+    }
+  });
+
   function certToPem(cert) {
     if (!cert || !cert.raw) return '';
     const b64 = Buffer.from(cert.raw).toString('base64');

@@ -1,14 +1,18 @@
 FROM node:20-slim
 
-  WORKDIR /app
+WORKDIR /app
 
-  COPY package*.json ./
-  RUN npm install --omit=dev
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends ca-certificates \
+  && rm -rf /var/lib/apt/lists/*
 
-  COPY . .
+COPY package*.json ./
+RUN npm install --omit=dev
 
-  ENV NODE_ENV=production
-  ENV PORT=80
-  EXPOSE 80
+COPY . .
 
-  CMD ["npm", "start"]
+ENV NODE_ENV=production
+ENV PORT=80
+EXPOSE 80
+
+CMD ["npm", "start"]

@@ -1,5 +1,6 @@
   const express = require('express');
   const crypto = require('crypto');
+  const https = require('https');
   const axios = require('axios');
 
   const app = express();
@@ -25,6 +26,28 @@
     return crypto.timingSafeEqual(aa, bb);
   }
 
+  // WeChat OpenAPI requests:
+  // - 禁用 env proxy（云环境可能注入 HTTP(S)_PROXY 导致 MITM/self-signed）
+  // - 强制使用 https agent（避免某些环境自动代理/证书链异常）
+  const wxHttp = axios.create({
+    timeout: 10000,
+    proxy: false,
+    httpsAgent: new https.Agent({ keepAlive: true }),
+    headers: { 'User-Agent': 'wechat-official-gateway/1.0' },
+  });
+
+  function formatAxiosError(err) {
+    const anyErr = err || {};
+    const code = anyErr.code ? String(anyErr.code) : '';
+    const message = anyErr.message ? String(anyErr.message) : String(err);
+    const proxyEnv = {
+      HTTP_PROXY: Boolean(process.env.HTTP_PROXY || process.env.http_proxy),
+      HTTPS_PROXY: Boolean(process.env.HTTPS_PROXY || process.env.https_proxy),
+      NO_PROXY: Boolean(process.env.NO_PROXY || process.env.no_proxy),
+    };
+    return `${code ? `${code} ` : ''}${message} (proxyEnv=${JSON.stringify(proxyEnv)})`.trim();
+  }
+
   let accessTokenCache = { token: '', expiresAt: 0 };
 
   async function getAccessToken() {
@@ -35,9 +58,14 @@
     if (!appId || !secret) throw new Error('WECHAT_APP_ID / WECHAT_APP_SECRET 未配置');
 
     const url = 'https://api.weixin.qq.com/cgi-bin/token';
-    const { data } = await axios.get(url, {
-      params: { grant_type: 'client_credential', appid: appId, secret }
-    });
+    let data;
+    try {
+      ({ data } = await wxHttp.get(url, {
+        params: { grant_type: 'client_credential', appid: appId, secret }
+      }));
+    } catch (e) {
+      throw new Error(`get access_token http failed: ${formatAxiosError(e)}`);
+    }
 
     if (!data?.access_token) {
       throw new Error(`get access_token failed: ${data?.errcode || ''} ${data?.errmsg || ''}`.trim());
@@ -80,8 +108,7 @@
       }
 
       const accessToken = await getAccessToken();
-      const wxUrl = `https://api.weixin.qq.com/cgi-bin/message/subscribe/bizsend?
-  access_token=${encodeURIComponent(accessToken)}`;
+      const wxUrl = `https://api.weixin.qq.com/cgi-bin/message/subscribe/bizsend?access_token=${encodeURIComponent(accessToken)}`;
 
       const body = {
         touser: openId,
@@ -91,9 +118,14 @@
         ...(typeof scene === 'number' ? { scene } : {})
       };
 
-      const { data: wxOut } = await axios.post(wxUrl, body, {
-        headers: { 'Content-Type': 'application/json' }
-      });
+      let wxOut;
+      try {
+        ({ data: wxOut } = await wxHttp.post(wxUrl, body, {
+          headers: { 'Content-Type': 'application/json' }
+        }));
+      } catch (e) {
+        return res.status(502).json({ success: false, error: `wechat bizsend http failed: ${formatAxiosError(e)}` });
+      }
 
       if (wxOut?.errcode && wxOut.errcode !== 0) {
         return res.status(502).json({ success: false, error: `wechat bizsend failed: ${wxOut.errcode} ${wxOut.errmsg ||
@@ -115,9 +147,14 @@
     const accessToken = await getAccessToken();
     const url = 'https://api.weixin.qq.com/cgi-bin/ticket/getticket';
 
-    const { data } = await axios.get(url, {
-      params: { access_token: accessToken, type: 'jsapi' }
-    });
+    let data;
+    try {
+      ({ data } = await wxHttp.get(url, {
+        params: { access_token: accessToken, type: 'jsapi' }
+      }));
+    } catch (e) {
+      throw new Error(`get jsapi_ticket http failed: ${formatAxiosError(e)}`);
+    }
 
     if (!data || data.errcode !== 0 || !data.ticket) {
       throw new Error(`get jsapi_ticket failed: ${data?.errcode || ''} ${data?.errmsg || ''}`.trim());

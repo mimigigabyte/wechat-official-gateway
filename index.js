@@ -103,5 +103,5 @@
     }
   });
 
-  const port = process.env.PORT || 3000;
-  app.listen(port, () => console.log(`wechat gateway listening on ${port}`));
+  const port = Number(process.env.PORT || 80); 
+  app.listen(port, '0.0.0.0')

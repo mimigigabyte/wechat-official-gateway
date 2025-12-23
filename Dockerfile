@@ -8,7 +8,7 @@ FROM node:20-alpine
   COPY . .
 
   ENV NODE_ENV=production
-  ENV PORT=3000
-  EXPOSE 3000
+  ENV PORT=80
+  EXPOSE 80
 
   CMD ["npm", "start"]

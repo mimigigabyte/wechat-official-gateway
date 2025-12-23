@@ -36,6 +36,18 @@
     headers: { 'User-Agent': 'wechat-official-gateway/1.0' },
   });
 
+  function getProxyEnvSnapshot() {
+    const getVal = (k) => process.env[k] || process.env[k.toLowerCase()] || '';
+    const httpProxy = getVal('HTTP_PROXY');
+    const httpsProxy = getVal('HTTPS_PROXY');
+    const noProxy = getVal('NO_PROXY');
+    return {
+      HTTP_PROXY: httpProxy ? '[set]' : '',
+      HTTPS_PROXY: httpsProxy ? '[set]' : '',
+      NO_PROXY: noProxy ? String(noProxy).slice(0, 120) : '',
+    };
+  }
+
   function formatAxiosError(err) {
     const anyErr = err || {};
     const code = anyErr.code ? String(anyErr.code) : '';
@@ -48,6 +60,46 @@
     return `${code ? `${code} ` : ''}${message} (proxyEnv=${JSON.stringify(proxyEnv)})`.trim();
   }
 
+  async function wxFetchJson(url, opts) {
+    const u = new URL(url);
+    const params = (opts && opts.params) || {};
+    for (const [k, v] of Object.entries(params)) {
+      if (v === undefined || v === null || v === '') continue;
+      u.searchParams.set(k, String(v));
+    }
+
+    try {
+      const res = await fetch(u.toString(), {
+        method: (opts && opts.method) || 'GET',
+        headers: {
+          'Content-Type': 'application/json',
+          'User-Agent': 'wechat-official-gateway/1.0',
+          ...((opts && opts.headers) || {}),
+        },
+        body: opts && opts.body ? JSON.stringify(opts.body) : undefined,
+        signal: AbortSignal.timeout(10000),
+      });
+
+      const text = await res.text().catch(() => '');
+      let data = null;
+      try {
+        data = text ? JSON.parse(text) : null;
+      } catch {
+        data = null;
+      }
+
+      if (!res.ok) {
+        const msg = data && (data.errmsg || data.message) ? (data.errmsg || data.message) : text;
+        throw new Error(`http ${res.status} ${String(msg || '').slice(0, 300)}`.trim());
+      }
+      return data;
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      const proxyEnv = getProxyEnvSnapshot();
+      throw new Error(`wx fetch failed: ${msg} (proxyEnv=${JSON.stringify(proxyEnv)})`);
+    }
+  }
+
   let accessTokenCache = { token: '', expiresAt: 0 };
 
   async function getAccessToken() {
@@ -57,14 +109,22 @@
     const secret = process.env.WECHAT_APP_SECRET;
     if (!appId || !secret) throw new Error('WECHAT_APP_ID / WECHAT_APP_SECRET 未配置');
 
-    const url = 'https://api.weixin.qq.com/cgi-bin/token';
-    let data;
+    // 先用 Node fetch（不吃 env proxy），失败再回退 axios（便于对比诊断）
+    let data = null;
     try {
-      ({ data } = await wxHttp.get(url, {
-        params: { grant_type: 'client_credential', appid: appId, secret }
-      }));
+      data = await wxFetchJson('https://api.weixin.qq.com/cgi-bin/token', {
+        params: { grant_type: 'client_credential', appid: appId, secret },
+      });
     } catch (e) {
-      throw new Error(`get access_token http failed: ${formatAxiosError(e)}`);
+      try {
+        const out = await wxHttp.get('https://api.weixin.qq.com/cgi-bin/token', {
+          params: { grant_type: 'client_credential', appid: appId, secret }
+        });
+        data = out.data;
+      } catch (e2) {
+        const msg1 = e instanceof Error ? e.message : String(e);
+        throw new Error(`get access_token http failed: ${msg1}; axiosFallback=${formatAxiosError(e2)}`);
+      }
     }
 
     if (!data?.access_token) {
@@ -76,7 +136,63 @@
     return accessTokenCache.token;
   }
 
-  app.get('/healthz', (_req, res) => res.json({ ok: true }));
+  app.get('/healthz', (_req, res) =>
+    res.json({
+      ok: true,
+      node: process.version,
+      proxyEnv: getProxyEnvSnapshot(),
+      now: new Date().toISOString(),
+    }),
+  );
+
+  // 诊断：直接测试与 api.weixin.qq.com 的 TLS 握手与证书信息（不依赖 access_token）
+  app.get('/debug/wechat-tls', async (_req, res) => {
+    const proxyEnv = getProxyEnvSnapshot();
+    try {
+      const result = await new Promise((resolve, reject) => {
+        const req = https.request(
+          {
+            hostname: 'api.weixin.qq.com',
+            port: 443,
+            path: '/',
+            method: 'GET',
+            timeout: 10000,
+          },
+          (r) => {
+            const socket = r.socket;
+            const cert = socket && socket.getPeerCertificate ? socket.getPeerCertificate(true) : null;
+            r.resume();
+            resolve({
+              statusCode: r.statusCode || 0,
+              cert: cert
+                ? {
+                    subject: cert.subject,
+                    issuer: cert.issuer,
+                    subjectaltname: cert.subjectaltname,
+                    valid_from: cert.valid_from,
+                    valid_to: cert.valid_to,
+                    fingerprint256: cert.fingerprint256,
+                    serialNumber: cert.serialNumber,
+                  }
+                : null,
+            });
+          },
+        );
+        req.on('error', reject);
+        req.on('timeout', () => req.destroy(new Error('timeout')));
+        req.end();
+      });
+
+      return res.json({ ok: true, proxyEnv, ...result });
+    } catch (e) {
+      return res.json({
+        ok: false,
+        proxyEnv,
+        error: e instanceof Error ? e.message : String(e),
+        code: e && e.code ? String(e.code) : '',
+      });
+    }
+  });
 
   // Vercel -> 网关：发送订阅通知
   app.post('/wechat/subscribe-send', async (req, res) => {
@@ -120,11 +236,9 @@
 
       let wxOut;
       try {
-        ({ data: wxOut } = await wxHttp.post(wxUrl, body, {
-          headers: { 'Content-Type': 'application/json' }
-        }));
+        wxOut = await wxFetchJson(wxUrl, { method: 'POST', body });
       } catch (e) {
-        return res.status(502).json({ success: false, error: `wechat bizsend http failed: ${formatAxiosError(e)}` });
+        return res.status(502).json({ success: false, error: `wechat bizsend http failed: ${e instanceof Error ? e.message : String(e)}` });
       }
 
       if (wxOut?.errcode && wxOut.errcode !== 0) {
@@ -147,22 +261,21 @@
     const accessToken = await getAccessToken();
     const url = 'https://api.weixin.qq.com/cgi-bin/ticket/getticket';
 
-    let data;
     try {
-      ({ data } = await wxHttp.get(url, {
-        params: { access_token: accessToken, type: 'jsapi' }
-      }));
+      const data = await wxFetchJson(url, {
+        params: { access_token: accessToken, type: 'jsapi' },
+      });
+
+      if (!data || data.errcode !== 0 || !data.ticket) {
+        throw new Error(`get jsapi_ticket failed: ${data?.errcode || ''} ${data?.errmsg || ''}`.trim());
+      }
+
+      const expiresIn = typeof data.expires_in === 'number' ? data.expires_in : 7000;
+      jsapiTicketCache = { ticket: data.ticket, expiresAt: Date.now() + (expiresIn - 300) * 1000 };
+      return jsapiTicketCache.ticket;
     } catch (e) {
-      throw new Error(`get jsapi_ticket http failed: ${formatAxiosError(e)}`);
+      throw new Error(`get jsapi_ticket http failed: ${e instanceof Error ? e.message : String(e)}`);
     }
-
-    if (!data || data.errcode !== 0 || !data.ticket) {
-      throw new Error(`get jsapi_ticket failed: ${data?.errcode || ''} ${data?.errmsg || ''}`.trim());
-    }
-
-    const expiresIn = typeof data.expires_in === 'number' ? data.expires_in : 7000;
-    jsapiTicketCache = { ticket: data.ticket, expiresAt: Date.now() + (expiresIn - 300) * 1000 };
-    return jsapiTicketCache.ticket;
   }
 
   function nonceStr(len = 16) {
@@ -234,4 +347,4 @@
   });
 
   const port = Number(process.env.PORT || 80); 
-  app.listen(port, '0.0.0.0')
+  app.listen(port, '0.0.0.0');

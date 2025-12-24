@@ -479,7 +479,7 @@
     }
   });
 
-  // ===== JS-SDK 签名：网关接口 =====
+  // ===== JS-SDK 签名：网关接口啊啊 =====
   let jsapiTicketCache = { ticket: '', expiresAt: 0 };
 
   async function getJsApiTicket() {

@@ -425,35 +425,17 @@
         return res.status(400).json({ success: false, error: 'missing openId/templateId/data' });
       }
 
-      // 默认走服务号一次性订阅通知：/cgi-bin/message/subscribe/bizsend
-      // 若要按文档试验 page 参数（你给的 api_sendnewsubscribemsg 示例风格），设置：
-      //   WECHAT_SUBSCRIBE_API=send
-      // 此时将调用 /cgi-bin/message/subscribe/send，并把传入的 url 映射到 page 字段。
-      const subscribeApi = String(process.env.WECHAT_SUBSCRIBE_API || 'bizsend').toLowerCase();
-      const isSendApi = subscribeApi === 'send';
-
       const wxUrl = openApiEnabled
-        ? `${wechatBaseUrl}${isSendApi ? '/cgi-bin/message/subscribe/send' : '/cgi-bin/message/subscribe/bizsend'}`
-        : `${wechatBaseUrl}${isSendApi ? '/cgi-bin/message/subscribe/send' : '/cgi-bin/message/subscribe/bizsend'}?access_token=${encodeURIComponent(await getAccessToken())}`;
+        ? `${wechatBaseUrl}/cgi-bin/message/subscribe/bizsend`
+        : `${wechatBaseUrl}/cgi-bin/message/subscribe/bizsend?access_token=${encodeURIComponent(await getAccessToken())}`;
 
-      const body = isSendApi
-        ? {
-            touser: openId,
-            template_id: templateId,
-            // 试验：把上层传入的 url 放到 page（按你给的文档示例来）
-            ...(url ? { page: url } : {}),
-            // 这两个字段是 send 接口常见参数；不确定是否强制，给默认值便于直接试
-            miniprogram_state: process.env.WECHAT_SUBSCRIBE_MINIPROGRAM_STATE || 'formal',
-            lang: process.env.WECHAT_SUBSCRIBE_LANG || 'zh_CN',
-            data,
-          }
-        : {
-            touser: openId,
-            template_id: templateId,
-            data,
-            ...(url ? { url } : {}),
-            ...(typeof scene === 'number' ? { scene } : {}),
-          };
+      const body = {
+        touser: openId,
+        template_id: templateId,
+        data,
+        ...(url ? { url } : {}),
+        ...(typeof scene === 'number' ? { scene } : {})
+      };
 
       let wxOut;
       try {
@@ -462,9 +444,7 @@
         return res.status(502).json({
           success: false,
           error: `wechat bizsend http failed: ${e instanceof Error ? e.message : String(e)}`,
-          hint: openApiEnabled
-            ? `若提示 api unauthorized，请在云托管控制台-云调用-微信令牌权限配置中添加 ${isSendApi ? '/cgi-bin/message/subscribe/send' : '/cgi-bin/message/subscribe/bizsend'}`
-            : undefined,
+          hint: openApiEnabled ? '若提示 api unauthorized，请在云托管控制台-云调用-微信令牌权限配置中添加 /cgi-bin/message/subscribe/bizsend' : undefined,
         });
       }
 

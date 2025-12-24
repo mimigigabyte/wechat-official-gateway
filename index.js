@@ -144,6 +144,34 @@
     return `${code ? `${code} ` : ''}${message} (proxyEnv=${JSON.stringify(proxyEnv)})`.trim();
   }
 
+  function maskOpenId(openId) {
+    const s = String(openId || '');
+    if (!s) return '';
+    if (s.length <= 8) return `${s.slice(0, 2)}***${s.slice(-2)}`;
+    return `${s.slice(0, 4)}***${s.slice(-4)}`;
+  }
+
+  function sanitizeWxPayload(payload) {
+    const p = payload || {};
+    const out = {
+      touser: maskOpenId(p.touser),
+      template_id: p.template_id ? String(p.template_id) : '',
+      page: p.page ? String(p.page) : '',
+      // 只打印 data 的 key 与 value 长度，避免把用户内容写入日志
+      data: {},
+    };
+    try {
+      const data = p.data && typeof p.data === 'object' ? p.data : {};
+      for (const [k, v] of Object.entries(data)) {
+        const value = v && typeof v === 'object' && 'value' in v ? String(v.value || '') : '';
+        out.data[k] = { valueLen: value.length };
+      }
+    } catch {
+      // ignore
+    }
+    return out;
+  }
+
   async function wxFetchJson(url, opts) {
     const u = new URL(url);
     const params = (opts && opts.params) || {};
@@ -437,6 +465,15 @@
         data,
         ...(url ? { page: url } : {}),
       };
+
+      // 调试：打印发送到微信的请求体
+      // - WECHAT_DEBUG_LOG_PAYLOAD=1：打印脱敏/摘要版本（默认）
+      // - WECHAT_DEBUG_LOG_PAYLOAD_FULL=1：打印完整版本（包含 openid 与 data 内容，谨慎开启）
+      if (String(process.env.WECHAT_DEBUG_LOG_PAYLOAD || '') === '1') {
+        const full = String(process.env.WECHAT_DEBUG_LOG_PAYLOAD_FULL || '') === '1';
+        const printable = full ? body : sanitizeWxPayload(body);
+        console.log('WX_SUBSCRIBE_REQUEST_PAYLOAD', JSON.stringify(printable));
+      }
 
       let wxOut;
       try {
